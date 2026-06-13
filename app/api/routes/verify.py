@@ -32,7 +32,7 @@ from app.core.cache import get_cached, set_cached
 from app.db.mongo import UserHistoryRepository
 from app.models.history import UserHistoryRecord
 from app.models.request import VerifyRequest
-from app.models.response import VerifyResponse, JudgeResponse
+from app.models.response import VerifyResponse, JudgeResponse, ClaimResult
 from app.services.preprocessing.query_preprocessor import QueryPreprocessor
 from app.services.analytics.tracker import AnalyticsTracker, VerificationEvent
 
@@ -51,6 +51,9 @@ _QUERY_TYPE_TTL: dict[str, int] = {
 }
 _DEFAULT_VERIFY_TTL: int = 3600    # 1 hour fallback for unknown query types
 
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+_MAX_QUESTION_LOG_CHARS = 1000  # Truncate question before passing to background task
 
 # ── Background task: async history persistence ────────────────────────────────
 
@@ -160,16 +163,22 @@ async def verify(
 
         # Still write history for cache hits — the user's audit trail should
         # record every request they made, cached or not.
-        background_tasks.add_task(
-            _write_history,
-            db=request.app.state.db,
-            user_id=user_id,
-            request_id=request_id,
-            question=body.question,
-            score=final_response.score,
-            verdict=final_response.verdict,
-            cache_hit=True,
-        )
+        if request.app.state.db is not None:
+            background_tasks.add_task(
+                _write_history,
+                db=request.app.state.db,
+                user_id=user_id,
+                request_id=request_id,
+                question=body.question[:_MAX_QUESTION_LOG_CHARS],
+                score=final_response.score,
+                verdict=final_response.verdict,
+                cache_hit=True,
+            )
+        else:
+            logger.warning(
+                f"[{request_id}] Pipeline OK but history logging skipped — "
+                f"MongoDB is unavailable"
+            )
         return final_response
 
     # ── Pull singletons from app.state ────────────────────────────────────────
@@ -219,11 +228,25 @@ async def verify(
 
     # ── Layer 3 — Evidence Aggregation ───────────────────────────────────────
     aggregated_evidence = ""
+    source_confidence = 1.0
     try:
         evidence_list = list(evidence_map.values()) if evidence_map else []
         aggregated_evidence = aggregator.aggregate(evidence_list)
+        
+        # ── Layer 3b — Consensus Check ───────────────────────────────────────
+        # Only run mediator when multiple sources returned evidence
+        if len(evidence_map) > 1:
+            mediator = request.app.state.mediator
+            consensus_result = await mediator.check_consensus(
+                claims=processed.extracted_claims,
+                evidence_map=evidence_map,
+            )
+            # Use adjusted evidence that contains mediator conflict info
+            aggregated_evidence = consensus_result.adjusted_evidence
+            source_confidence = consensus_result.confidence
+            
     except Exception as e:
-        logger.warning(f"[{request_id}] Aggregation failed: {e}")
+        logger.warning(f"[{request_id}] Aggregation/Mediation failed: {e}")
         aggregated_evidence = ""
 
     # ── Layer 4 — LLM Judge ──────────────────────────────────────────────────
@@ -255,8 +278,30 @@ async def verify(
             explanation="Verification could not be completed due to service error.",
             flag=False,
         )
+    
+    # ── Layer 4b — Per-Claim Fine-Grained Scoring ─────────────────────────────
+    claim_results = None
+    try:
+        if processed.extracted_claims:
+            raw_claim_results = await judge.judge_per_claim(
+                request.question,
+                request.answer,
+                aggregated_evidence,
+                processed.extracted_claims,
+            )
+            if raw_claim_results:
+                claim_results = [
+                    ClaimResult(**cr) for cr in raw_claim_results
+                ]
+                logger.info(
+                    f"[{request_id}] Per-claim scoring complete | "
+                    f"claims_scored={len(claim_results)}"
+                )
+    except Exception as e:
+        logger.warning(f"[{request_id}] Per-claim scoring failed (non-fatal): {e}")
+        claim_results = None
 
-    # ── Layer 5 — Response Building ──────────────────────────────────────────
+    # ── Layer 5 — Response Building ────────────────────────────────
     processing_time_ms = int((time.perf_counter() - pipeline_start) * 1000)
     sources = list(evidence_map.keys()) if evidence_map else None
 
@@ -265,7 +310,22 @@ async def verify(
         "evidence_found": bool(aggregated_evidence),
         "evidence_snippets": evidence_map,
         "query_type": processed.query_type,
+        "timing": {
+            "preprocessing_ms": preprocessing_ms,
+            "retrieval_ms": retrieval_ms,
+            "judge_ms": judge_ms,
+            "total_ms": processing_time_ms,
+        },
     }
+    
+    # Extract provider/model info for benchmarking
+    judge_provider = getattr(judge, 'provider', None)
+    judge_model = getattr(judge, 'model', None)
+    # Ensure these are strings (getattr on MagicMock returns mock objects)
+    if judge_provider and not isinstance(judge_provider, str):
+        judge_provider = None
+    if judge_model and not isinstance(judge_model, str):
+        judge_model = None
 
     final_response = VerifyResponse.from_judge_response(
         judge_resp=judge_response,
@@ -273,6 +333,9 @@ async def verify(
         request_id=request_id,
         processing_time_ms=processing_time_ms,
         debug=debug_info,
+        claim_results=claim_results,
+        provider=judge_provider,
+        model=judge_model,
     )
 
     # ── Layer 5b — Cache the completed result ─────────────────────────────────
@@ -289,6 +352,12 @@ async def verify(
         else:
             cache_ttl = _QUERY_TYPE_TTL.get(processed.query_type, _DEFAULT_VERIFY_TTL)
 
+        # Skip full-TTL cache for very low-confidence consensus results
+        min_score_to_cache = 0.5  # scores below this = too uncertain to freeze for days
+        if not _judge_failed and source_confidence < min_score_to_cache:
+            cache_ttl = 3600  # Still cache but with a short TTL so it retries soon
+            logger.info(f"[{request_id}] Low source confidence ({source_confidence:.2f}), limiting cache TTL to 3600s")
+
         await set_cached(verify_cache_key, final_response.model_dump(), ttl=cache_ttl)
 
         if _judge_failed:
@@ -304,42 +373,60 @@ async def verify(
         logger.warning(f"[{request_id}] Cache store failed (non-fatal): {e}")
 
     # ── Analytics Tracking ───────────────────────────────────────────────────
-    try:
-        tracker = AnalyticsTracker()
-        tracker.record(VerificationEvent(
-            request_id=request_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            question_preview=body.question[:80],
-            answer_preview=body.answer[:120],
-            score=final_response.score,
-            verdict=final_response.verdict,
-            sources_used=sources or [],
-            processing_time_ms=processing_time_ms,
-            claims_count=len(processed.extracted_claims),
-            evidence_chars=len(aggregated_evidence),
-            provider=getattr(judge, "provider", ""),
-            query_type=processed.query_type,
-            sentences_found=processed.sentences_found,
-            factual_sentences=processed.factual_sentences,
-            preprocessing_time_ms=preprocessing_ms,
-            retrieval_time_ms=retrieval_ms,
-            judge_time_ms=judge_ms,
-        ))
-    except Exception as e:
-        logger.warning(f"[{request_id}] Analytics tracking failed: {e}")
+    if request.app.state.db is not None:
+        try:
+            tracker = AnalyticsTracker()
+            event = VerificationEvent(
+                request_id=request_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                question_preview=body.question[:80],
+                answer_preview=body.answer[:120],
+                score=final_response.score,
+                verdict=final_response.verdict,
+                sources_used=sources or [],
+                processing_time_ms=processing_time_ms,
+                claims_count=len(processed.extracted_claims),
+                evidence_chars=len(aggregated_evidence),
+                provider=getattr(judge, "provider", ""),
+                query_type=processed.query_type,
+                sentences_found=processed.sentences_found,
+                factual_sentences=processed.factual_sentences,
+                preprocessing_time_ms=preprocessing_ms,
+                retrieval_time_ms=retrieval_ms,
+                judge_time_ms=judge_ms,
+            )
+            background_tasks.add_task(
+                tracker.record_async,
+                db=request.app.state.db,
+                event=event,
+                user_id=user_id
+            )
+        except Exception as e:
+            logger.warning(f"[{request_id}] Analytics tracking failed: {e}")
+    else:
+        logger.warning(
+            f"[{request_id}] Pipeline OK but analytics tracking skipped — "
+            f"MongoDB is unavailable"
+        )
 
     # ── Background: persist per-user history to MongoDB ──────────────────────
     # This fires AFTER the response has been sent — zero latency impact.
-    background_tasks.add_task(
-        _write_history,
-        db=request.app.state.db,
-        user_id=user_id,
-        request_id=request_id,
-        question=body.question,
-        score=final_response.score,
-        verdict=final_response.verdict,
-        cache_hit=False,
-    )
+    if request.app.state.db is not None:
+        background_tasks.add_task(
+            _write_history,
+            db=request.app.state.db,
+            user_id=user_id,
+            request_id=request_id,
+            question=body.question[:_MAX_QUESTION_LOG_CHARS],
+            score=final_response.score,
+            verdict=final_response.verdict,
+            cache_hit=False,
+        )
+    else:
+        logger.warning(
+            f"[{request_id}] Pipeline OK but history logging skipped — "
+            f"MongoDB is unavailable"
+        )
 
     logger.info(
         f"[{request_id}] Verify pipeline complete ({processing_time_ms}ms) | "

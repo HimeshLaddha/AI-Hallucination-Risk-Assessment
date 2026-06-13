@@ -5,7 +5,7 @@ Loads environment variables from .env file.
 
 import json
 from typing import Any
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator
 from functools import lru_cache
 
@@ -23,8 +23,9 @@ class Settings(BaseSettings):
     port: int = 8000
     
     # LLM Configuration
-    llm_provider: str = "gemini"  # "gemini" or "openai"
+    llm_provider: str = "gemini"  # "gemini", "openai", "groq", "grok", or "anthropic"
     llm_api_key: str = ""
+    grok_api_key: str = ""
     llm_model: str = "gemini-2.0-flash"  # or "gpt-4", "gpt-3.5-turbo"
     llm_api_base: str = ""
     
@@ -99,10 +100,11 @@ class Settings(BaseSettings):
         description="MongoDB database name for per-user history",
     )
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-        extra = "ignore"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=False,
+        extra="ignore"
+    )
 
 
 @lru_cache()

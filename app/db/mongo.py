@@ -30,21 +30,32 @@ logger = get_logger(__name__)
 
 # Collection name — shared constant so nothing is hard-coded elsewhere.
 HISTORY_COLLECTION = "user_history"
+EVENTS_COLLECTION = "verification_events"
 
 # ── Index definitions ─────────────────────────────────────────────────────────
-# B-Tree index on ``user_id`` — the primary access pattern is
-#   db.user_history.find({"user_id": <uid>}).sort("timestamp", -1).skip(…).limit(…)
-# Without this index every paginated request performs a full collection scan.
 _HISTORY_INDEXES: list[IndexModel] = [
     IndexModel(
         [("user_id", ASCENDING)],
         name="idx_user_id",
-        background=True,   # non-blocking build; doesn't lock the collection
+        background=True,   # non-blocking build
     ),
     IndexModel(
         [("user_id", ASCENDING), ("timestamp", -1)],
         name="idx_user_id_timestamp",
-        background=True,   # compound index for paginated, time-sorted queries
+        background=True,
+    ),
+]
+
+_EVENTS_INDEXES: list[IndexModel] = [
+    IndexModel(
+        [("user_id", ASCENDING)],
+        name="idx_events_user_id",
+        background=True,
+    ),
+    IndexModel(
+        [("timestamp", -1)],
+        name="idx_events_timestamp",
+        background=True,
     ),
 ]
 
@@ -81,11 +92,18 @@ async def init_mongo(mongodb_url: str, database_name: str) -> AsyncIOMotorDataba
 
     # Ensure indexes exist.  ``create_indexes`` is idempotent — safe to call on
     # every startup even if the indexes already exist.
-    collection = db[HISTORY_COLLECTION]
-    await collection.create_indexes(_HISTORY_INDEXES)
+    history_collection = db[HISTORY_COLLECTION]
+    await history_collection.create_indexes(_HISTORY_INDEXES)
     logger.info(
         f"MongoDB indexes ensured on '{HISTORY_COLLECTION}': "
         f"{[idx.document['name'] for idx in _HISTORY_INDEXES]}"
+    )
+
+    events_collection = db[EVENTS_COLLECTION]
+    await events_collection.create_indexes(_EVENTS_INDEXES)
+    logger.info(
+        f"MongoDB indexes ensured on '{EVENTS_COLLECTION}': "
+        f"{[idx.document['name'] for idx in _EVENTS_INDEXES]}"
     )
 
     return db
@@ -127,14 +145,27 @@ class UserHistoryRepository:
 
         Args:
             record_dict: A plain dictionary produced by
-                         ``UserHistoryRecord.model_dump()``.
+                         ``UserHistoryRecord.to_mongo_doc()``.
+                         Must already have UUIDs and datetimes converted
+                         to BSON-safe types (str / datetime).
 
         Returns:
             The inserted document's ``_id`` as a hex string.
+
+        Raises:
+            No exceptions propagate — errors are logged and the method
+            returns an empty string so background threads exit gracefully.
         """
-        result = await self._col.insert_one(record_dict)
-        logger.debug(f"Inserted history record _id={result.inserted_id}")
-        return str(result.inserted_id)
+        try:
+            result = await self._col.insert_one(record_dict)
+            logger.debug(f"Inserted history record _id={result.inserted_id}")
+            return str(result.inserted_id)
+        except Exception as exc:
+            logger.error(
+                f"MongoDB insert failed (non-fatal): {exc}",
+                exc_info=True,
+            )
+            return ""
 
     async def list_for_user(
         self,
@@ -164,4 +195,7 @@ class UserHistoryRepository:
             .limit(limit)
         )
         docs = await cursor.to_list(length=limit)
+        for doc in docs:
+            if doc and "_id" in doc:
+                doc["_id"] = str(doc["_id"])
         return docs
