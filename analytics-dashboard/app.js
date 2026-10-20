@@ -4,6 +4,7 @@
  */
 
 const API_BASE = window.location.origin;
+
 let refreshInterval = null;
 
 // Chart instances (for proper destroy/recreate)
@@ -795,7 +796,10 @@ function setupVerify() {
     try {
       const res = await fetch(`${API_BASE}/api/verify`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJwb3N0bWFuX3Rlc3RfdXNlcl85OTkiLCJleHAiOjIwOTUwODA2NTJ9.QymqA1qaBHiFjhhqw8Ju7uJGDKlpwvZNuI7CjFVdfAw'
+        },
         body: JSON.stringify({ question, answer }),
       });
 

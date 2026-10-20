@@ -58,3 +58,5 @@ Thumbs.db
 .cache/
 redis_dump.rdb
 data/
+
+venv
